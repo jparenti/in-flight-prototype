@@ -1,0 +1,21 @@
+{
+  "name": "drone-route-prototype",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview",
+    "convert": "node scripts/convert-obj.js"
+  },
+  "dependencies": {
+    "lil-gui": "^0.19.2",
+    "three": "^0.164.1",
+    "three-mesh-bvh": "^0.9.9"
+  },
+  "devDependencies": {
+    "obj2gltf": "^3.1.6",
+    "vite": "^5.4.10"
+  }
+}

@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Drone Route Prototype</title>
+    <style>
+      :root { color-scheme: dark; }
+      html, body {
+        margin: 0; padding: 0; height: 100%; background: #0b0d10; color: #e6e6e6;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        overflow: hidden;
+        -webkit-tap-highlight-color: transparent;
+        touch-action: none;
+      }
+      #app { position: fixed; inset: 0; }
+      canvas { display: block; }
+      #loading {
+        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        background: #0b0d10; z-index: 10; font-size: 14px; color: #aaa;
+        transition: opacity 300ms ease;
+      }
+      #loading.hidden { opacity: 0; pointer-events: none; }
+
+      #fps {
+        position: fixed; top: 12px; left: 12px; z-index: 6;
+        background: rgba(0,0,0,0.55); color: #cbd1d9;
+        padding: 6px 10px; border-radius: 6px; font-size: 11px;
+        font-feature-settings: "tnum"; pointer-events: none;
+        backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+        white-space: nowrap; min-width: 90px;
+      }
+      #fps .warn { color: #ff9b3d; }
+      #fps .bad { color: #ff5b5b; }
+
+      /* ── Overlay ── */
+      #overlay {
+        position: fixed; inset: 0; z-index: 5;
+        pointer-events: none; /* let canvas receive interactions; controls re-enable below */
+        font-feature-settings: "tnum";
+      }
+      #overlay button, #overlay .ctl {
+        pointer-events: auto;
+        user-select: none; -webkit-user-select: none;
+      }
+
+      /* Pause button (bottom-center) */
+      #pause-btn {
+        position: absolute; left: 50%; bottom: 24px; transform: translateX(-50%);
+        width: 64px; height: 64px; border-radius: 50%;
+        background: rgba(0,0,0,0.55); color: #fff; border: 1.5px solid rgba(255,255,255,0.15);
+        font-size: 26px; line-height: 1; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        transition: background 120ms ease, transform 120ms ease;
+      }
+      #pause-btn:hover { background: rgba(0,0,0,0.7); }
+      #pause-btn:active { transform: translateX(-50%) scale(0.94); }
+      #pause-btn.queued { box-shadow: 0 0 0 2px #ffd400; }
+
+      /* Lock-on toggle (sits above the pause button, visible when a focus marker exists) */
+      #lock-btn {
+        position: absolute; left: 50%; bottom: 102px; transform: translateX(-50%);
+        display: none;
+        background: rgba(0,0,0,0.55); color: #fff;
+        border: 1.5px solid rgba(255,255,255,0.15);
+        border-radius: 22px; padding: 8px 14px;
+        font-size: 13px; line-height: 1; cursor: pointer;
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        white-space: nowrap;
+      }
+      body.has-focus-marker #lock-btn { display: block; }
+      body.locked-on #lock-btn {
+        background: rgba(255, 212, 0, 0.22);
+        color: #ffd400;
+        border-color: rgba(255, 212, 0, 0.55);
+      }
+
+      /* Joystick is disabled while locked-on (gimbal is auto-controlled) */
+      body.locked-on #joystick { opacity: 0.35; pointer-events: none; }
+
+      /* Gimbal cluster (bottom-right) */
+      #gimbal {
+        position: absolute; right: 18px; bottom: 18px;
+        display: flex; flex-direction: column; align-items: center; gap: 12px;
+      }
+      #gimbal-row { display: flex; align-items: flex-end; gap: 12px; }
+
+      .gimbal-btn {
+        width: 44px; height: 44px; border-radius: 50%;
+        background: rgba(0,0,0,0.55); color: #fff; border: 1.5px solid rgba(255,255,255,0.12);
+        font-size: 18px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+      }
+      .gimbal-btn:hover { background: rgba(0,0,0,0.7); }
+      .gimbal-btn:active { transform: scale(0.94); }
+      .gimbal-btn.queued { box-shadow: 0 0 0 2px #ffd400; }
+
+      #zoom-stack { display: flex; flex-direction: column; gap: 6px; }
+      #zoom-readout {
+        text-align: center; font-size: 11px; color: #cbd1d9;
+        background: rgba(0,0,0,0.4); padding: 2px 6px; border-radius: 6px;
+        min-width: 36px;
+      }
+
+      #joystick {
+        width: 110px; height: 110px; border-radius: 50%;
+        background: rgba(0,0,0,0.4); border: 1.5px solid rgba(255,255,255,0.1);
+        position: relative;
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        pointer-events: auto;
+        touch-action: none;
+      }
+      #joystick-thumb {
+        position: absolute; left: 50%; top: 50%;
+        width: 40px; height: 40px; margin-left: -20px; margin-top: -20px;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.85); border: 1.5px solid rgba(0,0,0,0.2);
+        transition: transform 80ms ease-out;
+        pointer-events: none;
+      }
+      #joystick.active #joystick-thumb { transition: none; }
+      #joystick-label {
+        position: absolute; left: 0; right: 0; top: -22px;
+        text-align: center; font-size: 11px; color: #aaa;
+      }
+
+      /* Movement D-pad (bottom-left) — only visible when paused & in free-fly */
+      #movement {
+        position: absolute; left: 18px; bottom: 18px;
+        display: none;
+        flex-direction: row; align-items: flex-end; gap: 14px;
+      }
+      body.freefly #movement { display: flex; }
+      #move-pad { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+      #movement-row { display: flex; gap: 6px; align-items: center; }
+      #altitude-stack { display: flex; flex-direction: column; gap: 6px; align-items: center; }
+      #altitude-stack .alt-label {
+        font-size: 10px; color: #888; text-align: center;
+      }
+      .move-btn {
+        width: 50px; height: 50px; border-radius: 12px;
+        background: rgba(0,0,0,0.55); color: #fff; border: 1.5px solid rgba(255,255,255,0.12);
+        font-size: 22px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        touch-action: none;
+      }
+      .move-btn:hover { background: rgba(0,0,0,0.7); }
+      .move-btn:active, .move-btn.held { background: rgba(255,212,0,0.25); }
+      #movement-label {
+        font-size: 11px; color: #aaa; text-align: center;
+      }
+
+      /* Bigger touch targets on small screens */
+      @media (max-width: 720px) {
+        #pause-btn { width: 72px; height: 72px; font-size: 30px; bottom: 28px; }
+        .gimbal-btn { width: 50px; height: 50px; font-size: 20px; }
+        #joystick { width: 130px; height: 130px; }
+        #joystick-thumb { width: 50px; height: 50px; margin-left: -25px; margin-top: -25px; }
+        .move-btn { width: 56px; height: 56px; font-size: 24px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+    <div id="loading">Loading model…</div>
+    <div id="fps">-- fps</div>
+
+    <div id="overlay">
+      <button id="pause-btn" title="Play / Pause" aria-label="Play / Pause">▶</button>
+      <button id="lock-btn" title="Lock camera onto the marker and orbit with the movement controls" aria-label="Toggle lock-on">Lock on target</button>
+
+      <div id="movement" aria-label="Movement controls">
+        <div id="move-pad">
+          <button id="move-forward" class="move-btn" data-dir="forward" title="Forward (W)" aria-label="Forward">↑</button>
+          <div id="movement-row">
+            <button id="move-left" class="move-btn" data-dir="left" title="Strafe left (A)" aria-label="Strafe left">←</button>
+            <button id="move-back" class="move-btn" data-dir="back" title="Backward (S)" aria-label="Backward">↓</button>
+            <button id="move-right" class="move-btn" data-dir="right" title="Strafe right (D)" aria-label="Strafe right">→</button>
+          </div>
+          <div id="movement-label">Move (camera-relative)</div>
+        </div>
+        <div id="altitude-stack">
+          <button id="move-up" class="move-btn" data-dir="up" title="Ascend (E)" aria-label="Ascend">⤒</button>
+          <button id="move-down" class="move-btn" data-dir="down" title="Descend (Q)" aria-label="Descend">⤓</button>
+          <div class="alt-label">Altitude</div>
+        </div>
+      </div>
+
+      <div id="gimbal">
+        <div id="gimbal-row">
+          <button id="gimbal-reset" class="gimbal-btn" title="Reset gimbal" aria-label="Reset gimbal">⟲</button>
+          <div id="zoom-stack">
+            <button id="zoom-in" class="gimbal-btn" title="Zoom in" aria-label="Zoom in">+</button>
+            <div id="zoom-readout">1.0×</div>
+            <button id="zoom-out" class="gimbal-btn" title="Zoom out" aria-label="Zoom out">−</button>
+          </div>
+          <div id="joystick" aria-label="Gimbal joystick">
+            <div id="joystick-label">Pan / Tilt</div>
+            <div id="joystick-thumb"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
