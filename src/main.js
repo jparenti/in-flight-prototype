@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
+import { RGBELoader } from 'three/examples/jsm/loaders/RGBELoader.js';
 import GUI from 'lil-gui';
 
 import { createWaypointSprite, createLandingPadSprite, createPhotoSprite, createTargetNumberSprite, setTargetNumberSpriteState } from './sprites.js';
@@ -68,6 +69,22 @@ scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xffffff, 1.4);
 sun.position.set(1, 2.5, 1);
 scene.add(sun);
+
+// ─── Skybox + image-based environment lighting ────────────────────────────────
+// Single equirectangular HDR drives both the visible backdrop and the
+// scene's PBR environment. PMREM converts the panorama into the prefiltered
+// mipmap pyramid GLTF/MeshStandardMaterial expects for env reflections.
+const pmrem = new THREE.PMREMGenerator(renderer);
+pmrem.compileEquirectangularShader();
+new RGBELoader()
+  .setDataType(THREE.HalfFloatType)
+  .load(`${import.meta.env.BASE_URL}skybox/pizzo_pernice_puresky_2k.hdr`, (hdrTex) => {
+    const envMap = pmrem.fromEquirectangular(hdrTex).texture;
+    scene.background = envMap;
+    scene.environment = envMap;
+    hdrTex.dispose();
+    pmrem.dispose();
+  });
 
 // ─── Load model ───────────────────────────────────────────────────────────────
 const dracoLoader = new DRACOLoader();
