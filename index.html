@@ -70,7 +70,10 @@
         white-space: nowrap;
       }
       body.has-focus-marker #lock-btn { display: block; }
+      /* Person-lock activates locked-on without a focus marker — keep the
+         unlock button reachable in that case too. */
       body.locked-on #lock-btn {
+        display: block;
         background: rgba(255, 212, 0, 0.22);
         color: #ffd400;
         border-color: rgba(255, 212, 0, 0.55);
@@ -78,6 +81,9 @@
 
       /* Pan/Tilt pad is disabled while locked-on (gimbal is auto-controlled) */
       body.locked-on #pan-tilt-pad { opacity: 0.35; pointer-events: none; }
+
+      /* Hide the reset-rotation button when nothing would change. */
+      body.gimbal-default #gimbal-reset { display: none; }
 
       /* Gimbal cluster (bottom-right) */
       #gimbal {
@@ -169,6 +175,36 @@
         border: 1.5px solid rgba(0,0,0,0.2);
         pointer-events: none;
       }
+      /* Static center label inside each joystick (e.g. "Move", "Rotate").
+         Sits behind the thumb at rest; visible while the thumb is offset. */
+      .drag-joystick-label {
+        position: absolute;
+        left: 50%; top: 50%;
+        transform: translate(-50%, -50%);
+        font-size: 11px;
+        letter-spacing: 0.5px;
+        color: rgba(255,255,255,0.85);
+        text-transform: uppercase;
+        font-weight: 500;
+        pointer-events: none;
+        user-select: none; -webkit-user-select: none;
+      }
+
+      /* Top-center toast that announces mode changes (free-fly, locked,
+         resuming, etc). Auto-fades after a moment. */
+      #mode-message {
+        position: fixed;
+        top: 18px; left: 50%; transform: translateX(-50%);
+        background: rgba(0,0,0,0.6); color: #e6e6e6;
+        padding: 8px 16px; border-radius: 18px;
+        font-size: 13px; font-weight: 500; letter-spacing: 0.3px;
+        white-space: nowrap;
+        opacity: 0; transition: opacity 200ms ease;
+        pointer-events: none;
+        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+        z-index: 8;
+      }
+      #mode-message.visible { opacity: 1; }
 
       /* Bigger touch targets on small screens */
       @media (max-width: 720px) {
@@ -193,6 +229,7 @@
     <div id="app"></div>
     <div id="loading">Loading model…</div>
     <div id="fps">-- fps</div>
+    <div id="mode-message"></div>
 
     <div id="overlay">
       <button id="pause-btn" title="Play / Pause" aria-label="Play / Pause">▶</button>

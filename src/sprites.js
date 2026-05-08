@@ -54,7 +54,10 @@ function makeCircleSprite({
 
   if (label) {
     ctx.fillStyle = labelColor;
-    ctx.font = `bold ${Math.round(size * 0.42)}px -apple-system, "Segoe UI", sans-serif`;
+    // Shrink the font when the label is multi-digit (e.g. "10") so it doesn't
+    // overflow the circle.
+    const fontFrac = label.length > 1 ? 0.32 : 0.42;
+    ctx.font = `bold ${Math.round(size * fontFrac)}px -apple-system, "Segoe UI", sans-serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(label, size / 2, size / 2 + size * 0.02);
@@ -204,6 +207,43 @@ export function createPhotoSprite(label, worldScale) {
   sprite.scale.setScalar(worldScale);
   sprite.renderOrder = 9;
   return sprite;
+}
+
+// Red badge with a number — anchored above each "person" target. Numbered 1-3
+// dynamically based on the order people enter the camera frame. Has three
+// visual states: 'default' (red), 'hover' (red w/ yellow outline), and
+// 'selected' (yellow — same accent the lock-on UI uses elsewhere).
+export function createTargetNumberSprite(num, worldScale, initialState = 'default') {
+  const mat = new THREE.SpriteMaterial({
+    depthTest: false,
+    depthWrite: false,
+    transparent: true,
+    sizeAttenuation: true
+  });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.setScalar(worldScale);
+  sprite.renderOrder = 12;
+  setTargetNumberSpriteState(sprite, num, initialState);
+  return sprite;
+}
+
+// Idempotent — early-return if already on the requested {num, state}, so
+// calling this every frame from the tick is cheap.
+export function setTargetNumberSpriteState(sprite, num, state) {
+  const meta = sprite._spriteMeta;
+  if (meta && meta.num === num && meta.state === state) return;
+  if (sprite.material.map) sprite.material.map.dispose();
+  let opts;
+  if (state === 'selected') {
+    opts = { fill: '#ffd400', label: String(num), labelColor: '#0b0d10', stroke: '#0b0d10', strokeWidth: 6 };
+  } else if (state === 'hover') {
+    opts = { fill: '#ff7373', label: String(num), labelColor: '#ffffff', stroke: '#ffd400', strokeWidth: 8 };
+  } else {
+    opts = { fill: '#ff5b5b', label: String(num), labelColor: '#ffffff', stroke: '#0b0d10', strokeWidth: 6 };
+  }
+  sprite.material.map = makeCircleSprite(opts);
+  sprite.material.needsUpdate = true;
+  sprite._spriteMeta = { num, state };
 }
 
 export function createLandingPadSprite(worldScale) {

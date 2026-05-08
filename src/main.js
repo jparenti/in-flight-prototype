@@ -4,8 +4,9 @@ import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js';
 import GUI from 'lil-gui';
 
-import { createWaypointSprite, createLandingPadSprite, createPhotoSprite } from './sprites.js';
+import { createWaypointSprite, createLandingPadSprite, createPhotoSprite, createTargetNumberSprite, setTargetNumberSpriteState } from './sprites.js';
 import { createDrone } from './drone.js';
+import { createPeople } from './people.js';
 import { buildDroneCurve, buildTubeForRange } from './path.js';
 import { attachGimbalControls } from './gimbalControls.js';
 import { attachDragRotate } from './dragRotate.js';
@@ -175,6 +176,14 @@ const state = {
     fromPos: new THREE.Vector3(),
     toPos: new THREE.Vector3(),
     point: null,
+    // When set, the focus animation re-derives `point` and `toPos` from
+    // movingTarget.position each frame so the drone glides toward a moving
+    // person rather than the position they occupied at lock time. glideDir
+    // is the horizontal approach direction captured at lock-on, kept fixed
+    // for the rest of the glide so the drone slides in along a straight line
+    // rather than spiraling around the target.
+    movingTarget: null,
+    glideDir: { x: 0, z: 0 },
     viewingDistance: 25,   // m horizontal distance from the point
     viewingHeight: 6,      // m above the point's altitude
     cruiseSpeed: 5,        // m/s — animation pace. Real inspection drones move at ~5–10 m/s.
@@ -188,11 +197,31 @@ const state = {
 
   // Lock-on / orbit mode. When active, movement controls take orbital semantics:
   // forward/back = closer/farther, left/right = orbit, up/down = altitude.
-  // Each frame the drone+gimbal are forced to look at lockOn.point.
+  // Each frame the drone+gimbal are forced to look at lockOn.point. When
+  // `target` is set, lockOn.point is refreshed from target.position each frame
+  // so the drone tracks moving objects (the "people" targets).
   lockOn: {
     active: false,
-    point: null
+    point: null,
+    target: null,
+    // Target's world position from the previous frame. While locked on a
+    // moving target, the drone is translated horizontally each frame by
+    // (target.now - prevTargetPos) so the relative offset is preserved —
+    // i.e., the drone follows instead of just re-aiming.
+    prevTargetPos: null
   },
+
+  // Walking-people targets. peopleLabels is a 10-slot array; index i holds the
+  // person mesh currently displaying badge "i+1" (or null if free). Slots are
+  // assigned in the order people first become eligible (in frustum + close).
+  // peopleSprites maps person.mesh → its number sprite.
+  people: null,
+  peopleLabels: new Array(10).fill(null),
+  peopleSprites: new Map(),
+  // Person mesh under the pointer right now (or null). Drives the 'hover'
+  // sprite state in updatePeopleLabels. Set by a pointermove raycaster on
+  // the canvas; cleared on pointerleave.
+  hoveredPersonMesh: null,
 
   // User-driven yaw during playback. Tracks the camera's *absolute world yaw*
   // (radians) so the camera holds its world heading even when the route
@@ -268,6 +297,74 @@ gltfLoader.load(
     console.log('Model bbox size (m):', dim, 'diag:', diag.toFixed(1));
 
     setupRoute();
+    // 3 people clustered near the model center, plus 5 scattered randomly
+    // across the model footprint so the drone encounters more of them along
+    // the route. Each person spawns with random patrol radius / speed inside
+    // people.js, so the cluster doesn't end up moving in lockstep.
+    //
+    // Each home position is rejected unless getTerrainY returns a hit there —
+    // otherwise the person would spawn at the bbox floor (y=0) and end up
+    // sitting underneath the visible surface in any spot where the model has
+    // no mesh directly above the bbox floor.
+    const _modelCenter = new THREE.Vector3();
+    state.modelBox.getCenter(_modelCenter);
+    const _modelSize = new THREE.Vector3();
+    state.modelBox.getSize(_modelSize);
+
+    function sampleNearCenter(cx, cz, radius, attempts = 25) {
+      for (let i = 0; i < attempts; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const d = Math.random() * radius;
+        const x = cx + Math.cos(a) * d;
+        const z = cz + Math.sin(a) * d;
+        const ty = getTerrainY(x, z);
+        if (ty !== null) return new THREE.Vector3(x, ty, z);
+      }
+      // Last-resort fallback: the requested center, if valid.
+      const ty = getTerrainY(cx, cz);
+      return new THREE.Vector3(cx, ty ?? 0, cz);
+    }
+    function sampleInBox(minX, minZ, maxX, maxZ, attempts = 40) {
+      for (let i = 0; i < attempts; i++) {
+        const x = minX + Math.random() * (maxX - minX);
+        const z = minZ + Math.random() * (maxZ - minZ);
+        const ty = getTerrainY(x, z);
+        if (ty !== null) return new THREE.Vector3(x, ty, z);
+      }
+      const cx = (minX + maxX) * 0.5, cz = (minZ + maxZ) * 0.5;
+      const ty = getTerrainY(cx, cz);
+      return new THREE.Vector3(cx, ty ?? 0, cz);
+    }
+
+    const homePositions = [];
+    const clusterSpread = state.worldScale * 3.5;
+    for (let i = 0; i < 3; i++) {
+      const a = (i / 3) * Math.PI * 2 + (Math.random() - 0.5) * 0.6;
+      const d = clusterSpread * (0.5 + Math.random() * 0.6);
+      homePositions.push(sampleNearCenter(
+        _modelCenter.x + Math.cos(a) * d,
+        _modelCenter.z + Math.sin(a) * d,
+        clusterSpread * 0.4
+      ));
+    }
+    // Scattered: anywhere within ~80% of the model's horizontal extent. The
+    // shrink keeps them away from the bbox edges where terrain raycasts can
+    // miss the mesh.
+    const scatterHalfX = _modelSize.x * 0.4;
+    const scatterHalfZ = _modelSize.z * 0.4;
+    for (let i = 0; i < 5; i++) {
+      homePositions.push(sampleInBox(
+        _modelCenter.x - scatterHalfX, _modelCenter.z - scatterHalfZ,
+        _modelCenter.x + scatterHalfX, _modelCenter.z + scatterHalfZ
+      ));
+    }
+    state.people = createPeople({
+      scene,
+      worldScale: state.worldScale,
+      getTerrainY,
+      homePositions,
+      maxWanderRadius: state.worldScale * 2.0
+    });
     setupGUI();
     setupOverlay();
     // setupRoute → applyCameraMode positions the camera correctly for the
@@ -752,6 +849,7 @@ function ensureFreeFlyInitialized() {
 
 function cancelFocusAnim() {
   state.focusAnim.active = false;
+  state.focusAnim.movingTarget = null;
 }
 
 // Build the focus marker once, lazily. Returns the existing one on subsequent calls.
@@ -798,19 +896,94 @@ function hideFocusMarker() {
   document.body.classList.remove('has-focus-marker');
 }
 
-function setLockOn(active) {
+function setLockOn(active, target = null) {
+  if (active) {
+    // Number-key locks can be triggered while playing — make sure the drone
+    // is paused so the orbit/lock math (which lives in the paused-free-fly
+    // branch) actually runs.
+    ensurePaused();
+    ensureFreeFlyInitialized();
+    cancelFocusAnim();
+  }
   state.lockOn.active = !!active;
-  if (active && state.focusMarker) {
+  state.lockOn.target = active ? target : null;
+  if (active && target) {
+    state.lockOn.point = target.position.clone();
+    // Snapshot the target's current position so the first follow-frame's
+    // delta is zero — without this the drone would jump by the target's
+    // world position on the lock frame.
+    state.lockOn.prevTargetPos = target.position.clone();
+    // A person-lock has no yellow focus marker — clear any pre-existing one
+    // so the UI stops advertising the static lock point the user set earlier.
+    hideFocusMarker();
+    // Mirror the double-click focus behavior: glide the drone to a viewing
+    // position relative to the target. The animation re-derives its goal
+    // from target.position each frame, so a moving person is "chased" during
+    // the glide. Once it ends, the steady-state follow takes over.
+    startGlideToTarget(target);
+  } else if (active && state.focusMarker) {
     state.lockOn.point = state.focusMarker.position.clone();
+    state.lockOn.prevTargetPos = null;
+  } else {
+    state.lockOn.prevTargetPos = null;
   }
   document.body.classList.toggle('locked-on', state.lockOn.active);
   syncOverlayLockButton();
+  if (active) showModeMessage(target ? 'Following target' : 'Camera locked');
+}
+
+// Set up the focus animation to glide the drone toward `target`. The approach
+// direction is captured now and held fixed; fa.point and fa.toPos are
+// refreshed from target.position each frame in the tick.
+function startGlideToTarget(target) {
+  const fa = state.focusAnim;
+  const dx = state.freeFly.pos.x - target.position.x;
+  const dz = state.freeFly.pos.z - target.position.z;
+  const horiz = Math.hypot(dx, dz);
+  let approachX, approachZ;
+  if (horiz > 0.5) {
+    approachX = dx / horiz;
+    approachZ = dz / horiz;
+  } else {
+    approachX = Math.sin(state.freeFly.yaw);
+    approachZ = Math.cos(state.freeFly.yaw);
+  }
+  fa.glideDir.x = approachX;
+  fa.glideDir.z = approachZ;
+  fa.movingTarget = target;
+
+  fa.toPos.set(
+    target.position.x + approachX * fa.viewingDistance,
+    0,
+    target.position.z + approachZ * fa.viewingDistance
+  );
+  const ty = getTerrainY(fa.toPos.x, fa.toPos.z);
+  fa.toPos.y = Math.max(target.position.y + fa.viewingHeight, (ty ?? target.position.y) + state.movement.minClearance);
+
+  fa.fromPos.copy(state.freeFly.pos);
+  fa.point = target.position.clone();
+  fa.t = 0;
+  const glideDist = fa.fromPos.distanceTo(fa.toPos);
+  fa.duration = clampNum(glideDist / fa.cruiseSpeed, fa.minDuration, fa.maxDuration);
+  fa.active = true;
+}
+
+// Toggle/switch person lock through the latency queue so the queued-flash
+// timing matches every other on-screen control.
+function togglePersonLock(personMesh) {
+  if (!personMesh) return;
+  if (state.lockOn.active && state.lockOn.target === personMesh) {
+    enqueueAction(() => setLockOn(false));
+  } else {
+    enqueueAction(() => setLockOn(true, personMesh));
+  }
 }
 
 function syncOverlayLockButton() {
   const btn = document.getElementById('lock-btn');
   if (!btn) return;
-  btn.textContent = state.lockOn.active ? 'Unlock' : 'Lock on target';
+  const label = state.lockOn.active ? 'Unlock' : 'Lock on target';
+  btn.innerHTML = `${label}<span class="kbd-label"> (F)</span>`;
 }
 
 // Called via the latency queue in response to a double-click on the canvas.
@@ -850,9 +1023,16 @@ function focusOnPoint(point) {
   fa.fromPos.copy(state.freeFly.pos);
   fa.point = point.clone();
   fa.t = 0;
-  // If we're already locked on a target, carry the lock to the new point so
-  // orbital movement applies to the new focus once the glide finishes.
-  if (state.lockOn.active) state.lockOn.point = point.clone();
+  // If we're locked, person-locks get cleared (per spec: double-clicking a new
+  // point unlocks the moving target). Static-point locks instead carry to the
+  // new focus point so orbital movement applies once the glide finishes.
+  if (state.lockOn.active) {
+    if (state.lockOn.target) {
+      setLockOn(false);
+    } else {
+      state.lockOn.point = point.clone();
+    }
+  }
   // Scale duration by glide distance so velocity is roughly constant across
   // short and long focus moves (capped at min/max so it always feels deliberate).
   const glideDist = fa.fromPos.distanceTo(fa.toPos);
@@ -904,6 +1084,11 @@ function playPauseImmediate() {
     state.freeFly.yaw = Math.atan2(dfwd.x, dfwd.z);
     state.userYawActive = false;
     state.freeFly.initialized = true;
+    // Suppress the "Free-fly enabled" toast when this pause was triggered by
+    // a lock-on (which already announces "Camera locked" / "Following
+    // target") — setLockOn flips lockOn.active *before* enqueueing the
+    // pause, so this branch can detect it.
+    if (!state.lockOn.active) showModeMessage('Free-fly enabled');
   } else if (state.freeFly.initialized) {
     // → Play (smooth return to route at current t). Lock-on is exited and the
     // focus marker is hidden so the route view is unobstructed.
@@ -921,6 +1106,7 @@ function playPauseImmediate() {
     tr.fromPos.copy(state.freeFly.pos);
     tr.fromYaw = state.freeFly.yaw;
     tr.duration = clampNum(dist / tr.returnSpeed, tr.minDuration, tr.maxDuration);
+    showModeMessage('Resuming mission');
     // state.playing flips to true in the tick when the transition completes.
   } else {
     // First-ever play (no free-fly state captured yet — was paused at start)
@@ -947,6 +1133,7 @@ function resetGimbalImmediate() {
   }
   updateZoomReadout();
   updateDroneTransform();
+  showModeMessage('Camera rotation reset');
 }
 
 // Click steps: snap to next/prev integer tier (1×→2×→3×→4×→5×→1×). If zoom
@@ -1010,6 +1197,35 @@ function updateZoomReadout() {
   if (el) el.textContent = `${state.gimbal.zoom.toFixed(1)}×`;
 }
 
+// Top-center toast for mode-change announcements ("Free-fly enabled",
+// "Following target", etc). The latest message replaces any pending one;
+// auto-fades after 1.8s.
+let _modeMsgTimer = null;
+function showModeMessage(text) {
+  const el = document.getElementById('mode-message');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.add('visible');
+  if (_modeMsgTimer) clearTimeout(_modeMsgTimer);
+  _modeMsgTimer = setTimeout(() => {
+    el.classList.remove('visible');
+    _modeMsgTimer = null;
+  }, 1800);
+}
+
+// Hide the reset button when pressing it would be a no-op. userYawActive is
+// only cleared by reset during playback/transition/before-free-fly, so it only
+// blocks "default" in those modes.
+function syncResetButtonVisibility() {
+  const g = state.gimbal;
+  const pitchAtDefault = Math.abs(g.pitch) < 0.001;
+  const zoomAtDefault = Math.abs(g.zoom - 1) < 0.001;
+  const willResetYaw = state.playing || state.transition.active || !state.freeFly.initialized;
+  const yawAtDefault = !willResetYaw || !state.userYawActive;
+  const atDefault = pitchAtDefault && zoomAtDefault && yawAtDefault;
+  document.body.classList.toggle('gimbal-default', atDefault);
+}
+
 // ─── Overlay wiring ───────────────────────────────────────────────────────────
 function setupOverlay() {
   const pauseBtn = document.getElementById('pause-btn');
@@ -1025,6 +1241,28 @@ function setupOverlay() {
     // Lock toggle goes through the latency queue like other on-screen controls.
     lockBtn.addEventListener('click', () => enqueueAction(() => setLockOn(!state.lockOn.active), lockBtn));
   }
+  syncOverlayLockButton();
+
+  // F = lock-on toggle (only when the lock button would be visible — i.e., a
+  // focus marker exists). R = reset gimbal/zoom/yaw. Both route through the
+  // same latency queue as their button counterparts so the queued flash and
+  // delay match.
+  window.addEventListener('keydown', (e) => {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable)) return;
+    if (e.repeat) return;
+    if (e.code === 'KeyF') {
+      // Fires when there's a focus marker (about to lock) OR when already
+      // locked (to unlock — covers person-locks which never create a marker).
+      const canFire = document.body.classList.contains('has-focus-marker') || state.lockOn.active;
+      if (!canFire) return;
+      e.preventDefault();
+      enqueueAction(() => setLockOn(!state.lockOn.active), lockBtn);
+    } else if (e.code === 'KeyR') {
+      if (document.body.classList.contains('gimbal-default')) return;
+      e.preventDefault();
+      enqueueAction(resetGimbalImmediate, resetBtn);
+    }
+  });
 
   // Gimbal continuous input — joystick + keyboard + zoom buttons.
   // Zoom button taps are routed through the latency-applied action queue too.
@@ -1053,9 +1291,17 @@ function setupOverlay() {
   const overlayEl = document.getElementById('overlay');
   const dragRingRadius = 55;       // half of 110px width
   const dragThumbMax = dragRingRadius - 8;
-  const createDragFeedback = () => {
+  const createDragFeedback = (label = '') => {
     const ring = document.createElement('div');
     ring.className = 'drag-joystick';
+    if (label) {
+      // Label sits centered in the ring on its own layer — never moves with
+      // the thumb, so it acts as a passive "what does this gesture do" hint.
+      const labelEl = document.createElement('div');
+      labelEl.className = 'drag-joystick-label';
+      labelEl.textContent = label;
+      ring.appendChild(labelEl);
+    }
     const thumb = document.createElement('div');
     thumb.className = 'drag-joystick-thumb';
     ring.appendChild(thumb);
@@ -1095,7 +1341,7 @@ function setupOverlay() {
   // movement joystick stays inactive (the bottom-left WASD pad is still wired).
   const isTouchDevice = () => matchMedia('(hover: none) and (pointer: coarse)').matches;
 
-  const rotateFeedback = createDragFeedback();
+  const rotateFeedback = createDragFeedback('Rotate');
   state.dragInput = attachDragRotate(renderer.domElement, {
     // On mobile: right half only, and never while locked-on (rotation is
     // overridden each frame by the lock-on geometry). On desktop: full canvas.
@@ -1106,7 +1352,7 @@ function setupOverlay() {
     ...rotateFeedback
   });
 
-  const moveFeedback = createDragFeedback();
+  const moveFeedback = createDragFeedback('Move');
   state.dragMoveInput = attachDragMove(renderer.domElement, {
     // Mobile only. Left half normally; full canvas while locked-on (rotation
     // is disabled there, so the whole screen becomes movement).
@@ -1188,9 +1434,160 @@ function setupOverlay() {
     enqueueAction(() => focusOnPoint(point));
   });
 
+  // Single-tap on a person's number badge → toggle/switch lock-on. We listen
+  // on the canvas in addition to the existing drag/double-tap handlers.
+  // Drag-rotate has a 4px deadzone, so a clean tap (<4px movement, <300ms)
+  // never starts a drag — and our tap fires on pointerup. Larger movement
+  // cancels the tap and lets drag-rotate take over normally.
+  const spriteRay = new THREE.Raycaster();
+  let spriteTap = null; // { pointerId, downX, downY, downT, person }
+  renderer.domElement.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    if (!state.peopleSprites || state.peopleSprites.size === 0) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    spriteRay.setFromCamera(ndc, camera);
+    const sprites = Array.from(state.peopleSprites.values()).filter(s => s.visible);
+    if (!sprites.length) return;
+    const hits = spriteRay.intersectObjects(sprites, false);
+    if (!hits.length) return;
+    const hitSprite = hits[0].object;
+    let hitPerson = null;
+    for (const [mesh, sprite] of state.peopleSprites.entries()) {
+      if (sprite === hitSprite) { hitPerson = mesh; break; }
+    }
+    if (!hitPerson) return;
+    spriteTap = { pointerId: e.pointerId, downX: e.clientX, downY: e.clientY, downT: performance.now(), person: hitPerson };
+  });
+  renderer.domElement.addEventListener('pointermove', (e) => {
+    if (!spriteTap || spriteTap.pointerId !== e.pointerId) return;
+    if (Math.hypot(e.clientX - spriteTap.downX, e.clientY - spriteTap.downY) > 6) {
+      spriteTap = null;
+    }
+  });
+  renderer.domElement.addEventListener('pointerup', (e) => {
+    if (!spriteTap || spriteTap.pointerId !== e.pointerId) return;
+    const dt = performance.now() - spriteTap.downT;
+    const moved = Math.hypot(e.clientX - spriteTap.downX, e.clientY - spriteTap.downY);
+    const person = spriteTap.person;
+    spriteTap = null;
+    if (dt < 350 && moved < 6) togglePersonLock(person);
+  });
+  renderer.domElement.addEventListener('pointercancel', () => { spriteTap = null; });
+
+  // Hover detection on the canvas. Updates state.hoveredPersonMesh; the
+  // sprite state ('default' / 'hover' / 'selected') is computed from this
+  // and the lock-on target inside updatePeopleLabels.
+  renderer.domElement.addEventListener('pointermove', (e) => {
+    if (!state.peopleSprites || state.peopleSprites.size === 0) {
+      if (state.hoveredPersonMesh) state.hoveredPersonMesh = null;
+      return;
+    }
+    const rect = renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(
+      ((e.clientX - rect.left) / rect.width) * 2 - 1,
+      -((e.clientY - rect.top) / rect.height) * 2 + 1
+    );
+    spriteRay.setFromCamera(ndc, camera);
+    const sprites = Array.from(state.peopleSprites.values()).filter(s => s.visible);
+    if (!sprites.length) { state.hoveredPersonMesh = null; return; }
+    const hits = spriteRay.intersectObjects(sprites, false);
+    if (!hits.length) { state.hoveredPersonMesh = null; return; }
+    const hitSprite = hits[0].object;
+    for (const [mesh, sprite] of state.peopleSprites.entries()) {
+      if (sprite === hitSprite) { state.hoveredPersonMesh = mesh; return; }
+    }
+    state.hoveredPersonMesh = null;
+  });
+  renderer.domElement.addEventListener('pointerleave', () => { state.hoveredPersonMesh = null; });
+
+  // 1-9 + 0 → lock/switch/unlock the person currently labeled with that
+  // number. "0" maps to slot 10 (the badge that reads "10"). Pressing the
+  // number of the currently-locked target unlocks; pressing a different
+  // number switches lock-on. No-op when no person holds the number.
+  const digitToSlot = {
+    Digit1: 0, Digit2: 1, Digit3: 2, Digit4: 3, Digit5: 4,
+    Digit6: 5, Digit7: 6, Digit8: 7, Digit9: 8, Digit0: 9
+  };
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.isContentEditable)) return;
+    const slot = digitToSlot[e.code];
+    if (slot === undefined) return;
+    const personMesh = state.peopleLabels[slot];
+    if (!personMesh) return;
+    e.preventDefault();
+    togglePersonLock(personMesh);
+  });
+
   syncOverlayPauseIcon();
   syncOverlayMovementVisible();
   updateZoomReadout();
+}
+
+// Per-frame people-label sync: assigns the next free slot (1-3) when a person
+// becomes eligible (in frustum + within `maxDist`), frees the slot when they
+// become ineligible (unless currently locked-on), and keeps each badge
+// positioned above its person's head. Locked targets keep their slot even off-
+// screen so F-unlock and number-switch behavior stays predictable.
+const _frustum = new THREE.Frustum();
+const _frustumMat = new THREE.Matrix4();
+const _headAnchor = new THREE.Vector3();
+function updatePeopleLabels() {
+  if (!state.people) return;
+  const maxDist = state.worldScale * 15;
+  camera.updateMatrixWorld();
+  _frustumMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _frustum.setFromProjectionMatrix(_frustumMat);
+
+  const peopleArr = state.people.people;
+  for (let i = 0; i < peopleArr.length; i++) {
+    const p = peopleArr[i];
+    const mesh = p.mesh;
+    const inView = _frustum.containsPoint(mesh.position);
+    const close = camera.position.distanceTo(mesh.position) < maxDist;
+    const eligible = inView && close;
+    const labelIdx = state.peopleLabels.indexOf(mesh);
+    const isLocked = state.lockOn.active && state.lockOn.target === mesh;
+
+    if (eligible && labelIdx === -1) {
+      const free = state.peopleLabels.indexOf(null);
+      if (free !== -1) {
+        state.peopleLabels[free] = mesh;
+        const sprite = createTargetNumberSprite(free + 1, state.worldScale * 0.4);
+        scene.add(sprite);
+        state.peopleSprites.set(mesh, sprite);
+      }
+    } else if (!eligible && labelIdx !== -1 && !isLocked) {
+      state.peopleLabels[labelIdx] = null;
+      const sprite = state.peopleSprites.get(mesh);
+      if (sprite) {
+        scene.remove(sprite);
+        sprite.material.map?.dispose();
+        sprite.material.dispose();
+      }
+      state.peopleSprites.delete(mesh);
+    }
+
+    const sprite = state.peopleSprites.get(mesh);
+    if (sprite) {
+      state.people.getHeadAnchor(i, _headAnchor);
+      sprite.position.copy(_headAnchor);
+      // Resolve sprite state: selected (locked target) > hover (under pointer)
+      // > default. The slot index can shift across re-labelings, so we look
+      // up the current label idx instead of caching it.
+      const slot = state.peopleLabels.indexOf(mesh);
+      if (slot !== -1) {
+        let desired = 'default';
+        if (state.lockOn.active && state.lockOn.target === mesh) desired = 'selected';
+        else if (state.hoveredPersonMesh === mesh) desired = 'hover';
+        setTargetNumberSpriteState(sprite, slot + 1, desired);
+      }
+    }
+  }
 }
 
 // ─── Resize ───────────────────────────────────────────────────────────────────
@@ -1228,6 +1625,33 @@ function tick() {
   // Latency-applied user input — process before everything else so this frame
   // already reflects the (delayed) state changes.
   processActionQueue();
+
+  // Walking people move continuously, regardless of route playback. If a
+  // person is the active lock-on target, refresh lockOn.point from their
+  // current position so the orbital math (further down) tracks them this same
+  // frame instead of lagging by one tick. We also translate the drone by the
+  // target's horizontal delta so the relative offset is preserved — the
+  // drone *follows* instead of pivoting in place. Y delta is intentionally
+  // skipped so the drone holds altitude while the target walks up/down terrain.
+  if (state.people) {
+    state.people.update(dt);
+    if (state.lockOn.active && state.lockOn.target) {
+      const tp = state.lockOn.target.position;
+      const prev = state.lockOn.prevTargetPos;
+      // Apply the follow-delta only when nothing else owns the drone's
+      // position. The focus animation runs its own lerp toward the target,
+      // so we leave freeFly.pos alone while it's active — but we still keep
+      // prevTargetPos current so the first delta after the glide is fresh.
+      const followOK = state.freeFly.initialized && !state.playing && !state.transition.active && !state.focusAnim.active;
+      if (prev && followOK) {
+        state.freeFly.pos.x += tp.x - prev.x;
+        state.freeFly.pos.z += tp.z - prev.z;
+      }
+      if (prev) prev.copy(tp);
+      else state.lockOn.prevTargetPos = tp.clone();
+      state.lockOn.point.copy(tp);
+    }
+  }
   const cur = state.gimbalInput ? state.gimbalInput.read() : { yawRate: 0, pitchRate: 0 };
   // Drag is also rate-based — its thumb offset produces a continuous rate
   // until the user releases. Sum with the joystick/keyboard rate, clamped.
@@ -1274,7 +1698,7 @@ function tick() {
   // Higher priority than free-fly. Movement controls take orbital semantics:
   // forward/back = closer/farther, left/right = orbit around the target,
   // up/down = altitude. Drone+gimbal are forced to keep the target centered.
-  if (state.lockOn.active && state.lockOn.point && state.freeFly.initialized && !state.playing && !state.transition.active) {
+  if (state.lockOn.active && state.lockOn.point && state.freeFly.initialized && !state.playing && !state.transition.active && !state.focusAnim.active) {
     const target = state.lockOn.point;
     const fwdIn = delayed.moveFwd || 0;
     const strafeIn = delayed.moveStrafe || 0;
@@ -1393,6 +1817,21 @@ function tick() {
   // the target through the glide. Cancelled by any movement input.
   if (state.focusAnim.active) {
     const fa = state.focusAnim;
+    // If we're chasing a moving target, refresh the focus point and toPos
+    // from its current position. The approach direction (glideDir) was
+    // captured at lock-on and stays fixed, so the destination slides with
+    // the target instead of the drone curving around them.
+    if (fa.movingTarget) {
+      const tp = fa.movingTarget.position;
+      fa.point.copy(tp);
+      fa.toPos.set(
+        tp.x + fa.glideDir.x * fa.viewingDistance,
+        0,
+        tp.z + fa.glideDir.z * fa.viewingDistance
+      );
+      const tty = getTerrainY(fa.toPos.x, fa.toPos.z);
+      fa.toPos.y = Math.max(tp.y + fa.viewingHeight, (tty ?? tp.y) + state.movement.minClearance);
+    }
     fa.t = Math.min(1, fa.t + dt / fa.duration);
     const u = smoothstep01(fa.t);
     state.freeFly.pos.lerpVectors(fa.fromPos, fa.toPos, u);
@@ -1408,7 +1847,16 @@ function tick() {
       THREE.MathUtils.radToDeg(Math.atan2(dy, horizDist)),
       state.gimbal.pitchMin, state.gimbal.pitchMax
     );
-    if (fa.t >= 1) fa.active = false;
+    if (fa.t >= 1) {
+      fa.active = false;
+      // After a person-glide ends, also reset the prevTargetPos so the
+      // first follow-frame doesn't apply a stale delta accumulated during
+      // the glide.
+      if (fa.movingTarget && state.lockOn.target === fa.movingTarget) {
+        state.lockOn.prevTargetPos.copy(fa.movingTarget.position);
+      }
+      fa.movingTarget = null;
+    }
   }
 
   // Advance the return-to-route transition if active.
@@ -1450,6 +1898,7 @@ function tick() {
   // Always recompute drone transform (gimbal angle changes affect camera target
   // even when the drone isn't moving).
   updateDroneTransform();
+  syncResetButtonVisibility();
 
   if (state.drone?.userData.rotors) {
     const spin = (state.playing ? 35 : 8) * dt;
@@ -1479,6 +1928,12 @@ function tick() {
   // when disabled — which would silently force the camera to look at the
   // model center. Only run it in orbit mode.
   if (state.cameraMode === 'orbit') controls.update();
+
+  // People-label assignment + sprite positioning runs after the camera has
+  // eased into its new pose so frustum/distance checks reflect what the user
+  // actually sees this frame.
+  updatePeopleLabels();
+
   renderer.render(scene, camera);
   requestAnimationFrame(tick);
 }
