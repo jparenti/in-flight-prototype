@@ -76,8 +76,8 @@
         border-color: rgba(255, 212, 0, 0.55);
       }
 
-      /* Joystick is disabled while locked-on (gimbal is auto-controlled) */
-      body.locked-on #joystick { opacity: 0.35; pointer-events: none; }
+      /* Pan/Tilt pad is disabled while locked-on (gimbal is auto-controlled) */
+      body.locked-on #pan-tilt-pad { opacity: 0.35; pointer-events: none; }
 
       /* Gimbal cluster (bottom-right) */
       #gimbal {
@@ -95,6 +95,7 @@
       }
       .gimbal-btn:hover { background: rgba(0,0,0,0.7); }
       .gimbal-btn:active { transform: scale(0.94); }
+      .gimbal-btn.held { background: rgba(255,212,0,0.25); }
       .gimbal-btn.queued { box-shadow: 0 0 0 2px #ffd400; }
 
       #zoom-stack { display: flex; flex-direction: column; gap: 6px; }
@@ -104,27 +105,11 @@
         min-width: 36px;
       }
 
-      #joystick {
-        width: 110px; height: 110px; border-radius: 50%;
-        background: rgba(0,0,0,0.4); border: 1.5px solid rgba(255,255,255,0.1);
-        position: relative;
-        backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
-        pointer-events: auto;
-        touch-action: none;
-      }
-      #joystick-thumb {
-        position: absolute; left: 50%; top: 50%;
-        width: 40px; height: 40px; margin-left: -20px; margin-top: -20px;
-        border-radius: 50%;
-        background: rgba(255,255,255,0.85); border: 1.5px solid rgba(0,0,0,0.2);
-        transition: transform 80ms ease-out;
-        pointer-events: none;
-      }
-      #joystick.active #joystick-thumb { transition: none; }
-      #joystick-label {
-        position: absolute; left: 0; right: 0; top: -22px;
-        text-align: center; font-size: 11px; color: #aaa;
-      }
+      /* Pan/Tilt pad — desktop replacement for the legacy joystick. Reuses
+         .move-btn styling so it matches the WASD pad on the other side. */
+      #pan-tilt-pad { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+      #pan-tilt-row { display: flex; gap: 6px; align-items: center; }
+      #pan-tilt-label { font-size: 11px; color: #aaa; text-align: center; }
 
       /* Movement D-pad (bottom-left) — only visible when paused & in free-fly */
       #movement {
@@ -152,14 +137,55 @@
       #movement-label {
         font-size: 11px; color: #aaa; text-align: center;
       }
+      /* Buttons that show their keyboard shortcut on desktop and a directional
+         icon on mobile. The icon is hidden on desktop and shown on touch. */
+      .icon-label { display: none; }
+
+      /* Drag-feedback joystick — appears at the pointer-down location while
+         drag-rotating or drag-moving. Lingers faded for the latency window
+         so the user can see input still queued ahead of the camera. There
+         can be two on-screen at once when the user uses both halves of the
+         canvas simultaneously (rotation + movement on mobile). */
+      .drag-joystick {
+        position: absolute;
+        width: 110px; height: 110px;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.08);
+        border: 1.5px solid rgba(255,255,255,0.25);
+        backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+        pointer-events: none;
+        opacity: 0;
+        transition: opacity 160ms ease;
+      }
+      .drag-joystick.active { opacity: 0.85; }
+      .drag-joystick.lingering { opacity: 0.3; }
+      .drag-joystick-thumb {
+        position: absolute;
+        left: 50%; top: 50%;
+        width: 36px; height: 36px;
+        margin-left: -18px; margin-top: -18px;
+        border-radius: 50%;
+        background: rgba(255,255,255,0.85);
+        border: 1.5px solid rgba(0,0,0,0.2);
+        pointer-events: none;
+      }
 
       /* Bigger touch targets on small screens */
       @media (max-width: 720px) {
         #pause-btn { width: 72px; height: 72px; font-size: 30px; bottom: 28px; }
         .gimbal-btn { width: 50px; height: 50px; font-size: 20px; }
-        #joystick { width: 130px; height: 130px; }
-        #joystick-thumb { width: 50px; height: 50px; margin-left: -25px; margin-top: -25px; }
         .move-btn { width: 56px; height: 56px; font-size: 24px; }
+      }
+
+      /* On touch-only devices look-around comes from drag-rotate on the
+         canvas (so the pan/tilt button pad is hidden), and movement comes
+         from drag-move (so the WASD pad is hidden). Altitude stays — it
+         doesn't have a screen-direction analog within left-half-drag. */
+      @media (hover: none) and (pointer: coarse) {
+        #pan-tilt-pad { display: none; }
+        #move-pad { display: none; }
+        .icon-label { display: inline; }
+        .kbd-label { display: none; }
       }
     </style>
   </head>
@@ -174,17 +200,17 @@
 
       <div id="movement" aria-label="Movement controls">
         <div id="move-pad">
-          <button id="move-forward" class="move-btn" data-dir="forward" title="Forward (W)" aria-label="Forward">↑</button>
+          <button id="move-forward" class="move-btn" data-dir="forward" title="Forward (W)" aria-label="Forward">W</button>
           <div id="movement-row">
-            <button id="move-left" class="move-btn" data-dir="left" title="Strafe left (A)" aria-label="Strafe left">←</button>
-            <button id="move-back" class="move-btn" data-dir="back" title="Backward (S)" aria-label="Backward">↓</button>
-            <button id="move-right" class="move-btn" data-dir="right" title="Strafe right (D)" aria-label="Strafe right">→</button>
+            <button id="move-left" class="move-btn" data-dir="left" title="Strafe left (A)" aria-label="Strafe left">A</button>
+            <button id="move-back" class="move-btn" data-dir="back" title="Backward (S)" aria-label="Backward">S</button>
+            <button id="move-right" class="move-btn" data-dir="right" title="Strafe right (D)" aria-label="Strafe right">D</button>
           </div>
-          <div id="movement-label">Move (camera-relative)</div>
+          <div id="movement-label">Move</div>
         </div>
         <div id="altitude-stack">
-          <button id="move-up" class="move-btn" data-dir="up" title="Ascend (E)" aria-label="Ascend">⤒</button>
-          <button id="move-down" class="move-btn" data-dir="down" title="Descend (Q)" aria-label="Descend">⤓</button>
+          <button id="move-up" class="move-btn" data-dir="up" title="Ascend (E)" aria-label="Ascend"><span class="kbd-label">E</span><span class="icon-label">⤒</span></button>
+          <button id="move-down" class="move-btn" data-dir="down" title="Descend (Q)" aria-label="Descend"><span class="kbd-label">Q</span><span class="icon-label">⤓</span></button>
           <div class="alt-label">Altitude</div>
         </div>
       </div>
@@ -197,9 +223,14 @@
             <div id="zoom-readout">1.0×</div>
             <button id="zoom-out" class="gimbal-btn" title="Zoom out" aria-label="Zoom out">−</button>
           </div>
-          <div id="joystick" aria-label="Gimbal joystick">
-            <div id="joystick-label">Pan / Tilt</div>
-            <div id="joystick-thumb"></div>
+          <div id="pan-tilt-pad" aria-label="Pan/Tilt controls">
+            <button id="pan-up" class="move-btn" title="Tilt up (↑)" aria-label="Tilt up">↑</button>
+            <div id="pan-tilt-row">
+              <button id="pan-left" class="move-btn" title="Pan left (←)" aria-label="Pan left">←</button>
+              <button id="pan-down" class="move-btn" title="Tilt down (↓)" aria-label="Tilt down">↓</button>
+              <button id="pan-right" class="move-btn" title="Pan right (→)" aria-label="Pan right">→</button>
+            </div>
+            <div id="pan-tilt-label">Pan / Tilt</div>
           </div>
         </div>
       </div>

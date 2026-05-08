@@ -8,6 +8,9 @@ import { createWaypointSprite, createLandingPadSprite, createPhotoSprite } from 
 import { createDrone } from './drone.js';
 import { buildDroneCurve, buildTubeForRange } from './path.js';
 import { attachGimbalControls } from './gimbalControls.js';
+import { attachDragRotate } from './dragRotate.js';
+import { attachDragMove } from './dragMove.js';
+import { attachDoubleTap } from './doubleTap.js';
 
 // Wire BVH into three.js so raycasts against meshes with .boundsTree are O(log n).
 // Without this, getTerrainY walks every triangle of the 60MB model on every call.
@@ -22,6 +25,7 @@ const _gimbalQuat = new THREE.Quaternion();
 const _gimbalEuler = new THREE.Euler();
 const _yAxis = new THREE.Vector3(0, 1, 0);
 const _aheadOffset = new THREE.Vector3();
+const _droneFwdScratch = new THREE.Vector3();
 const _terrainRaycaster = new THREE.Raycaster();
 _terrainRaycaster.ray.direction.set(0, -1, 0);
 _terrainRaycaster.firstHitOnly = true; // honored if BVH is enabled; harmless otherwise
@@ -88,7 +92,7 @@ const state = {
   photoSeed: 7,
   // animation
   t: 0,
-  playing: false,
+  playing: true,
   duration: 30, // seconds for full route at speed=1
   speed: 0.1,
   loop: true,
@@ -117,7 +121,7 @@ const state = {
     zoomMin: 1.0,
     zoomMax: 5.0,
     baseFov: 75,
-    zoomStep: 0.06     // per zoom-button-tick (held repeats every 90ms)
+    zoomEaseRate: 8.0  // ~99% of fov target reached in ~0.575s
   },
 
   // ── Latency model ──
@@ -190,11 +194,15 @@ const state = {
     point: null
   },
 
-  // User-driven yaw offset applied during playback. The drone's autopilot still
-  // tracks the route, but the drone *body* rotates by this offset so the user
-  // can look around without pausing. Reset to 0 when the user pauses (the
-  // current angle is absorbed into freeFly.yaw).
-  userYawOffset: 0
+  // User-driven yaw during playback. Tracks the camera's *absolute world yaw*
+  // (radians) so the camera holds its world heading even when the route
+  // tangent changes. `userYawActive` is set on the first manual input (which
+  // also snapshots the drone's current world yaw as the baseline). Cleared on
+  // pause (current heading is absorbed into freeFly.yaw), on the transition
+  // back to play, and on reset — all of which return the camera to following
+  // the route tangent.
+  userWorldYaw: 0,
+  userYawActive: false
 };
 scene.add(state.pathRoot);
 scene.add(state.photosRoot);
@@ -553,11 +561,16 @@ function updateDroneTransform() {
     );
   } else {
     pos = routePos;
-    // Apply user yaw offset (look-around during playback) by rotating the
-    // route's "ahead" point around the drone position.
-    if (state.userYawOffset !== 0) {
-      _aheadOffset.subVectors(routeAhead, routePos).applyAxisAngle(_yAxis, state.userYawOffset);
-      ahead = _aheadOffset.clone().add(routePos);
+    if (state.userYawActive) {
+      // Camera holds an absolute world yaw — drone rotates to match. The
+      // route's vertical tangent is dropped (camera goes horizontal); pitch
+      // gives the user separate vertical control. Drone mesh is hidden in
+      // first-person, so its orientation here is visually moot.
+      ahead = new THREE.Vector3(
+        pos.x + Math.sin(state.userWorldYaw),
+        pos.y,
+        pos.z + Math.cos(state.userWorldYaw)
+      );
     } else {
       ahead = routeAhead;
     }
@@ -885,11 +898,11 @@ function playPauseImmediate() {
     state.freeFly.pos.copy(state.drone.position);
     // Drone uses Object3D.lookAt (+Z forward), so its forward in world is +Z * quat.
     // Yaw is the angle around Y where forward = (sin θ, 0, cos θ). θ = atan2(fwd.x, fwd.z).
-    // The drone's quaternion already reflects userYawOffset (applied in
+    // The drone's quaternion already reflects userWorldYaw (applied in
     // updateDroneTransform's route path), so freeFly.yaw absorbs it here.
     const dfwd = new THREE.Vector3(0, 0, 1).applyQuaternion(state.drone.quaternion);
     state.freeFly.yaw = Math.atan2(dfwd.x, dfwd.z);
-    state.userYawOffset = 0;
+    state.userYawActive = false;
     state.freeFly.initialized = true;
   } else if (state.freeFly.initialized) {
     // → Play (smooth return to route at current t). Lock-on is exited and the
@@ -923,17 +936,63 @@ function syncOverlayMovementVisible() {
 }
 
 function resetGimbalImmediate() {
-  state.gimbal.yaw = 0;
   state.gimbal.pitch = 0;
   state.gimbal.zoom = 1.0;
+  // Heading: during playback (or before free-fly is initialized) the route
+  // tangent is the "default" the camera should snap back to — clear the
+  // user's manual yaw flag. In free-fly there is no default heading, so
+  // leave freeFly.yaw alone and only reset the vertical look.
+  if (state.playing || state.transition.active || !state.freeFly.initialized) {
+    state.userYawActive = false;
+  }
   updateZoomReadout();
   updateDroneTransform();
 }
 
-function applyZoomStep(direction) {
+// Click steps: snap to next/prev integer tier (1×→2×→3×→4×→5×→1×). If zoom
+// is currently fractional (from scroll), the first click completes the partial
+// step rather than skipping it.
+function applyZoomTier(direction) {
   const g = state.gimbal;
-  g.zoom = clampNum(g.zoom + direction * g.zoomStep, g.zoomMin, g.zoomMax);
+  let next;
+  if (direction > 0) {
+    next = Math.floor(g.zoom + 1);
+    if (next > g.zoomMax) next = g.zoomMin;
+  } else {
+    next = Math.ceil(g.zoom - 1);
+    if (next < g.zoomMin) next = g.zoomMax;
+  }
+  g.zoom = next;
   updateZoomReadout();
+}
+
+// Scroll: each event nudges zoom by deltaY * sensitivity. Camera fov eases
+// toward baseFov/zoom in the tick, so this stays smooth even at high event
+// rates. Convention: scroll up (deltaY < 0) = zoom in.
+function applyZoomScroll(deltaY) {
+  const g = state.gimbal;
+  const sens = 0.005;
+  g.zoom = clampNum(g.zoom - deltaY * sens, g.zoomMin, g.zoomMax);
+  updateZoomReadout();
+}
+
+// Brief .held flash on the corresponding zoom button so the user sees feedback
+// for scroll input (which has no native button-press visual).
+let _zoomFlashBtn = null;
+let _zoomFlashTimer = null;
+function flashZoomButton(direction) {
+  const id = direction > 0 ? 'zoom-in' : 'zoom-out';
+  const btn = document.getElementById(id);
+  if (!btn) return;
+  if (_zoomFlashTimer) clearTimeout(_zoomFlashTimer);
+  if (_zoomFlashBtn && _zoomFlashBtn !== btn) _zoomFlashBtn.classList.remove('held');
+  btn.classList.add('held');
+  _zoomFlashBtn = btn;
+  _zoomFlashTimer = setTimeout(() => {
+    btn.classList.remove('held');
+    _zoomFlashBtn = null;
+    _zoomFlashTimer = null;
+  }, 120);
 }
 
 function syncOverlayPauseIcon() {
@@ -970,7 +1029,99 @@ function setupOverlay() {
   // Gimbal continuous input — joystick + keyboard + zoom buttons.
   // Zoom button taps are routed through the latency-applied action queue too.
   state.gimbalInput = attachGimbalControls({
-    onZoomStep: (dir) => enqueueAction(() => applyZoomStep(dir))
+    onZoomStep: (dir) => enqueueAction(() => applyZoomTier(dir))
+  });
+
+  // Scroll-to-zoom (desktop only). Skipped in orbit mode so OrbitControls'
+  // own wheel handler stays in charge of dollying. deltaMode normalizes the
+  // Firefox "lines" mode back to approximate pixels.
+  renderer.domElement.addEventListener('wheel', (e) => {
+    if (isTouchDevice()) return;
+    if (state.cameraMode !== 'firstPerson') return;
+    if (e.deltaY === 0) return;
+    e.preventDefault();
+    let dy = e.deltaY;
+    if (e.deltaMode === 1) dy *= 32;     // lines → ~pixels
+    else if (e.deltaMode === 2) dy *= 100; // pages → ~pixels
+    applyZoomScroll(dy);
+    flashZoomButton(-dy); // dy < 0 = zoom in (positive direction)
+  }, { passive: false });
+
+  // Translucent feedback joystick that shows at the touch point during drag.
+  // One element per drag handler so the rotation and movement gestures can be
+  // visualized simultaneously when the user has two fingers down.
+  const overlayEl = document.getElementById('overlay');
+  const dragRingRadius = 55;       // half of 110px width
+  const dragThumbMax = dragRingRadius - 8;
+  const createDragFeedback = () => {
+    const ring = document.createElement('div');
+    ring.className = 'drag-joystick';
+    const thumb = document.createElement('div');
+    thumb.className = 'drag-joystick-thumb';
+    ring.appendChild(thumb);
+    overlayEl.appendChild(ring);
+    let lingerTimer = null;
+    return {
+      onDragStart(x, y) {
+        if (lingerTimer) { clearTimeout(lingerTimer); lingerTimer = null; }
+        ring.style.left = `${x - dragRingRadius}px`;
+        ring.style.top = `${y - dragRingRadius}px`;
+        thumb.style.transform = '';
+        ring.classList.remove('lingering');
+        ring.classList.add('active');
+      },
+      onDragMove(_x, _y, totalDx, totalDy) {
+        let dx = totalDx, dy = totalDy;
+        const dist = Math.hypot(dx, dy);
+        if (dist > dragThumbMax) { dx = dx / dist * dragThumbMax; dy = dy / dist * dragThumbMax; }
+        thumb.style.transform = `translate(${dx}px, ${dy}px)`;
+      },
+      onDragEnd() {
+        ring.classList.remove('active');
+        ring.classList.add('lingering');
+        // Linger faded for the latency window — that's how long it takes for
+        // input still in inputHistory to be replayed by readDelayedInput.
+        const lingerMs = Math.max(120, state.latency * 1000);
+        lingerTimer = setTimeout(() => {
+          ring.classList.remove('lingering');
+          lingerTimer = null;
+        }, lingerMs);
+      }
+    };
+  };
+
+  // Touch-only devices split the canvas: right-half drags rotate; left-half
+  // drags translate. On non-touch devices, a drag anywhere rotates and the
+  // movement joystick stays inactive (the bottom-left WASD pad is still wired).
+  const isTouchDevice = () => matchMedia('(hover: none) and (pointer: coarse)').matches;
+
+  const rotateFeedback = createDragFeedback();
+  state.dragInput = attachDragRotate(renderer.domElement, {
+    // On mobile: right half only, and never while locked-on (rotation is
+    // overridden each frame by the lock-on geometry). On desktop: full canvas.
+    shouldStart: (e) => {
+      if (!isTouchDevice()) return true;
+      return !state.lockOn.active && e.clientX > window.innerWidth / 2;
+    },
+    ...rotateFeedback
+  });
+
+  const moveFeedback = createDragFeedback();
+  state.dragMoveInput = attachDragMove(renderer.domElement, {
+    // Mobile only. Left half normally; full canvas while locked-on (rotation
+    // is disabled there, so the whole screen becomes movement).
+    shouldStart: (e) => {
+      if (!isTouchDevice()) return false;
+      return state.lockOn.active || e.clientX <= window.innerWidth / 2;
+    },
+    onActivate: () => {
+      // Same hooks as a WASD keypress — pause the route, capture free-fly
+      // pose, and abort any in-progress focus animation.
+      ensurePaused();
+      ensureFreeFlyInitialized();
+      cancelFocusAnim();
+    },
+    ...moveFeedback
   });
 
   // Movement buttons — hold-to-move. Pressing any movement control auto-pauses
@@ -997,6 +1148,8 @@ function setupOverlay() {
     btn.addEventListener('pointerleave', release);
   }
   // WASD + Q/E keyboard equivalents (active only in free-fly via tick gating).
+  // Toggling `.held` on the on-screen button mirrors the visual feedback the
+  // user sees when pressing the button directly.
   const wasdMap = { KeyW: 'forward', KeyS: 'back', KeyA: 'left', KeyD: 'right', KeyE: 'up', KeyQ: 'down' };
   window.addEventListener('keydown', (e) => {
     const dir = wasdMap[e.code];
@@ -1005,27 +1158,31 @@ function setupOverlay() {
     e.preventDefault();
     if (e.repeat) return; // ignore key-repeat — only treat the initial press as a "new" input
     onMovementPressed(dir);
+    document.getElementById(`move-${dir}`)?.classList.add('held');
   });
   window.addEventListener('keyup', (e) => {
     const dir = wasdMap[e.code];
     if (!dir) return;
     state.movement[dir] = 0;
+    document.getElementById(`move-${dir}`)?.classList.remove('held');
   });
 
-  // Double-click on the canvas to focus the camera on the clicked map point.
+  // Double-tap (touch) / double-click (mouse) on the canvas to focus the
+  // camera on the tapped map point. Browser `dblclick` doesn't fire reliably
+  // on mobile with `touch-action: none`, so we detect tap-tap-up explicitly.
   // Raycast happens immediately (uses current camera) so the hit point is
   // accurate; the actual focus action is queued through the latency model.
-  const dblclickRay = new THREE.Raycaster();
-  dblclickRay.firstHitOnly = true;
-  renderer.domElement.addEventListener('dblclick', (e) => {
+  const tapRay = new THREE.Raycaster();
+  tapRay.firstHitOnly = true;
+  attachDoubleTap(renderer.domElement, (clientX, clientY) => {
     if (!state.model) return;
     const rect = renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
-      ((e.clientX - rect.left) / rect.width) * 2 - 1,
-      -((e.clientY - rect.top) / rect.height) * 2 + 1
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1
     );
-    dblclickRay.setFromCamera(ndc, camera);
-    const hits = dblclickRay.intersectObject(state.model, true);
+    tapRay.setFromCamera(ndc, camera);
+    const hits = tapRay.intersectObject(state.model, true);
     if (!hits.length) return;
     const point = hits[0].point.clone();
     enqueueAction(() => focusOnPoint(point));
@@ -1072,11 +1229,17 @@ function tick() {
   // already reflects the (delayed) state changes.
   processActionQueue();
   const cur = state.gimbalInput ? state.gimbalInput.read() : { yawRate: 0, pitchRate: 0 };
+  // Drag is also rate-based — its thumb offset produces a continuous rate
+  // until the user releases. Sum with the joystick/keyboard rate, clamped.
+  const dragR = state.dragInput ? state.dragInput.read() : { yawRate: 0, pitchRate: 0 };
+  const yawRateNow = clampNum(cur.yawRate + dragR.yawRate, -1, 1);
+  const pitchRateNow = clampNum(cur.pitchRate + dragR.pitchRate, -1, 1);
   const m = state.movement;
-  const moveFwdNow = (m.forward ? 1 : 0) - (m.back ? 1 : 0);
-  const moveStrafeNow = (m.right ? 1 : 0) - (m.left ? 1 : 0);
+  const moveDrag = state.dragMoveInput ? state.dragMoveInput.read() : { fwdRate: 0, strafeRate: 0 };
+  const moveFwdNow = clampNum((m.forward ? 1 : 0) - (m.back ? 1 : 0) + moveDrag.fwdRate, -1, 1);
+  const moveStrafeNow = clampNum((m.right ? 1 : 0) - (m.left ? 1 : 0) + moveDrag.strafeRate, -1, 1);
   const moveUpNow = (m.up ? 1 : 0) - (m.down ? 1 : 0);
-  pushInputSample(cur.yawRate, cur.pitchRate, moveFwdNow, moveStrafeNow, moveUpNow);
+  pushInputSample(yawRateNow, pitchRateNow, moveFwdNow, moveStrafeNow, moveUpNow);
 
   // Apply (delayed) gimbal pitch + drone yaw rotation rates.
   const delayed = readDelayedInput();
@@ -1084,20 +1247,26 @@ function tick() {
   g.pitch = clampNum(g.pitch + delayed.pitchRate * g.pitchSpeed * dt, g.pitchMin, g.pitchMax);
 
   // Yaw input rotates the drone (real-world gimbal can't pan independently).
-  // Joystick right (+1) → drone turns right (clockwise). Three.js Y is
-  // positive=CCW, so subtract.
+  // Joystick right (+1) → camera turns right; subtracting from yaw matches
+  // three.js's Y-rotation sign convention.
   // - In lock-on: ignored (orbital code overrides drone yaw each frame).
-  // - In free-fly: applied to freeFly.yaw (the drone's standalone yaw).
-  // - During playback / transition: applied to userYawOffset, an offset added
-  //   on top of the route's tangent so the user can look around without
-  //   pausing the route.
+  // - In free-fly: applied to freeFly.yaw (the drone's standalone world yaw).
+  // - During playback / transition: applied to userWorldYaw — the *absolute*
+  //   world yaw the camera should hold. The first input snapshots the drone's
+  //   current world yaw as the baseline, so the camera stays world-locked
+  //   even as the route turns.
   const yawDelta = delayed.yawRate * THREE.MathUtils.degToRad(g.yawSpeed) * dt;
   if (state.lockOn.active) {
     // no-op
   } else if (state.freeFly.initialized && !state.playing && !state.transition.active) {
     state.freeFly.yaw -= yawDelta;
   } else {
-    state.userYawOffset -= yawDelta;
+    if (yawDelta !== 0 && !state.userYawActive && state.drone) {
+      _droneFwdScratch.set(0, 0, 1).applyQuaternion(state.drone.quaternion);
+      state.userWorldYaw = Math.atan2(_droneFwdScratch.x, _droneFwdScratch.z);
+      state.userYawActive = true;
+    }
+    state.userWorldYaw -= yawDelta;
   }
   g.yaw = 0; // gimbal yaw is no longer an independent control
 
@@ -1256,10 +1425,12 @@ function tick() {
       syncOverlayMovementVisible();
     }
   }
-  // Gimbal targets the camera fov for zoom.
+  // Gimbal targets the camera fov for zoom — eased so both button-tier jumps
+  // and scroll deltas animate smoothly rather than snapping.
   const targetFov = g.baseFov / g.zoom;
-  if (Math.abs(camera.fov - targetFov) > 0.01) {
-    camera.fov = targetFov;
+  if (Math.abs(camera.fov - targetFov) > 0.001) {
+    const k = 1 - Math.exp(-g.zoomEaseRate * dt);
+    camera.fov += (targetFov - camera.fov) * k;
     camera.updateProjectionMatrix();
   }
 
